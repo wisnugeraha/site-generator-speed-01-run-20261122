@@ -633,55 +633,63 @@ export function parseTemplate(name, src) {
   // for-loops bind the item var and `loop` into a new scope; the chain is walked once per lookup at emit time.
   const fns = new Map();
 
+  const P_TEXT = 0, P_VAR = 1, P_RAW = 2, P_IF = 3, P_FOR = 4, P_INC = 5;
   const compile = (list, isRoot) => {
-    // Pre-scan: text nodes accumulate into segments; each var/raw/if/for/include becomes one part.
-    // The emit fn is a direct closure over `parts` — built once per body list, called per render.
-    const parts = [];
+    // Pre-scan: split into parallel arrays — partKinds (Uint8Array), partVals (array of the
+    // non-text payload, undefined for text slots), textChunks (array, text runs only).
+    // The emit loop indexes parts directly: no per-part object allocation at call time.
+    const partKinds = [];
+    const partVals = [];
+    const textChunks = [];
     let text = '';
     for (const n of list) {
       if (n.kind === 'text') { text += n.text; continue; }
-      if (text !== '') { parts.push(['text', text]); text = ''; }
-      if (n.kind === 'var') parts.push(['var', n.path]);
-      else if (n.kind === 'raw') parts.push(['raw', n.path]);
-      else if (n.kind === 'if') parts.push(['if', n]);
-      else if (n.kind === 'for') parts.push(['for', n]);
-      else parts.push(['include', n.name]);
+      if (text !== '') { partKinds.push(P_TEXT); partVals.push(undefined); textChunks.push(text); text = ''; }
+      if (n.kind === 'var') { partKinds.push(P_VAR); partVals.push(n.path); }
+      else if (n.kind === 'raw') { partKinds.push(P_RAW); partVals.push(n.path); }
+      else if (n.kind === 'if') { partKinds.push(P_IF); partVals.push(n); }
+      else if (n.kind === 'for') { partKinds.push(P_FOR); partVals.push(n); }
+      else { partKinds.push(P_INC); partVals.push(n.name); }
     }
-    if (text !== '') parts.push(['text', text]);
+    if (text !== '') { partKinds.push(P_TEXT); partVals.push(undefined); textChunks.push(text); }
+    const kinds = Uint8Array.from(partKinds);
+    const vals = partVals;
+    const tChunks = textChunks;
 
     const f = (g, ctx, depth, scope) => {
       let out = '';
       const esc = ctx.escape;
-      for (let p = 0; p < parts.length; p++) {
-        const part = parts[p];
-        if (part[0] === 'text') { out += part[1]; continue; }
-        if (part[0] === 'var' || part[0] === 'raw') {
-          let v = lookup(scope, part[1]);
-          out += part[0] === 'var' ? esc(textOf(v)) : textOf(v);
+      const N = kinds.length;
+      let tc = 0;
+      for (let p = 0; p < N; p++) {
+        const k = kinds[p];
+        if (k === P_TEXT) { out += tChunks[tc++]; continue; }
+        if (k === P_VAR || k === P_RAW) {
+          const v = lookup(scope, vals[p]);
+          out += k === P_VAR ? esc(textOf(v)) : textOf(v);
           continue;
         }
-        if (part[0] === 'if') {
-          const n = part[1];
+        if (k === P_IF) {
+          const n = vals[p];
           const v = truthy(lookup(scope, n.path));
           const use = v !== n.not ? n.then : n.else;
           if (use !== null) out += fns.get(use)(g, ctx, depth, scope);
           continue;
         }
-        if (part[0] === 'for') {
-          const n = part[1];
+        if (k === P_FOR) {
+          const n = vals[p];
           const xs = lookup(scope, n.path);
           if (!Array.isArray(xs)) continue;
           const len = xs.length;
           const inner = fns.get(n.body);
-          for (let k = 0; k < len; k++) {
-            const item = xs[k];
-            const l = { index: k + 1, first: k === 0, last: k === len - 1, length: len };
-            out += inner(g, ctx, depth, { vars: { [n.name]: item, loop: l }, parent: scope });
+          const iname = n.name;
+          for (let i2 = 0; i2 < len; i2++) {
+            const l = { index: i2 + 1, first: i2 === 0, last: i2 === len - 1, length: len };
+            out += inner(g, ctx, depth, { vars: { [iname]: xs[i2], loop: l }, parent: scope });
           }
           continue;
         }
-        // include
-        const t = ctx.templates.get(part[1]);
+        const t = ctx.templates.get(vals[p]);
         if (t !== undefined && depth < INCLUDE_DEPTH) out += t.fn(g, ctx, depth + 1, scope);
       }
       return out;
