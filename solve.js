@@ -1,30 +1,68 @@
 // fast-solve.js — faster drop-in for makefun-site 1.0.0 (agent's own code; same rules, byte-identical output).
 
 // ---------- text rules ----------
-const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const ESC_RE = /[&<>"']/g;
-
+// escapeHtml: fast path (no specials → return as-is, zero allocation); charCode loop for the rest.
 export function escapeHtml(text) {
-  return text.replace(ESC_RE, (c) => ESCAPES[c]);
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text.charCodeAt(i);
+    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) break;
+    i++;
+  }
+  if (i === n) return text;
+  let out = text.slice(0, i);
+  while (i < n) {
+    const c = text.charCodeAt(i);
+    if (c === 38) out += '&amp;';
+    else if (c === 60) out += '&lt;';
+    else if (c === 62) out += '&gt;';
+    else if (c === 34) out += '&quot;';
+    else if (c === 39) out += '&#39;';
+    else out += String.fromCharCode(c);
+    i++;
+  }
+  return out;
 }
 
 export const SLUG_MAX = 64;
 
 export function slugify(text) {
-  const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+  // Fast path: pure [A-Za-z0-9 ] ASCII needs no NFKD, no unicode scan.
+  const n0 = text.length;
+  let asciiClean = true;
+  for (let i = 0; i < n0; i++) {
+    const c = text.charCodeAt(i);
+    if (c > 127 || (c < 48 && c !== 32) || (c > 57 && c < 65) || (c > 90 && c < 97) || c > 122) { asciiClean = false; break; }
+  }
+  if (!asciiClean) {
+    const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+    let out = '';
+    let gap = false;
+    for (const ch of plain) {
+      let keep = null;
+      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+      if (keep === null) { gap = out.length > 0; continue; }
+      if (gap) out += '-';
+      gap = false;
+      out += keep;
+    }
+    out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
+    return out === '' ? 'untitled' : out;
+  }
   let out = '';
   let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) { gap = out.length > 0; continue; }
+  for (let i = 0; i < n0; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 32) { gap = out.length > 0; continue; }
     if (gap) out += '-';
     gap = false;
-    out += keep;
+    out += c >= 65 && c <= 90 ? String.fromCharCode(c + 32) : text[i];
   }
-  out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
-  return out === '' ? 'untitled' : out;
+  if (out.length > SLUG_MAX) out = out.slice(0, SLUG_MAX);
+  const t = out.replace(/-+$/, '');
+  return t === '' ? 'untitled' : t;
 }
 
 export function uniqueSlug(slug, taken) {
@@ -131,18 +169,27 @@ function valueOf(key, raw) {
       if (raw.charCodeAt(0) === 91) return 'key "' + key + '": a bare string opens on [';
       return raw;
     }
-    case 'date': return validDate(raw) ? raw : 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)';
+    case 'date': {
+      const v = validDate(raw);
+      return v ? raw : 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)';
+    }
     case 'tags': {
-      if (raw.charCodeAt(0) !== 91 || raw.charCodeAt(raw.length - 1) !== 93) return 'key "tags": not a list [a, b]';
+      const n = raw.length;
+      if (n < 2 || raw.charCodeAt(0) !== 91 || raw.charCodeAt(n - 1) !== 93) return 'key "tags": not a list [a, b]';
       const inner = raw.slice(1, -1);
       if (inner.trim() === '') return [];
-      const tags = inner.split(',').map((t) => t.trim());
-      for (const t of tags) if (t === '' || !TAG_RE.test(t)) return 'key "tags": an empty tag, or one holding " [ or ]';
+      const parts = inner.split(',');
+      const tags = new Array(parts.length);
+      for (let i = 0; i < parts.length; i++) {
+        const t = parts[i].trim();
+        tags[i] = t;
+        if (t === '' || !TAG_RE.test(t)) return 'key "tags": an empty tag, or one holding " [ or ]';
+      }
       return tags;
     }
     case 'draft': return raw === 'true' ? true : raw === 'false' ? false : 'key "draft": true or false';
     case 'layout': return NAME_RE.test(raw) ? raw : 'key "layout": not a template name';
-    case 'slug': return (SLUG_RE.test(raw) && raw.length <= 64) ? raw : 'key "slug": not a slug';
+    case 'slug': return SLUG_RE.test(raw) && raw.length <= 64 ? raw : 'key "slug": not a slug';
     default: return null; // unreachable: the caller checks the key first
   }
 }
@@ -215,29 +262,40 @@ function headingOf(line) {
   return m === null || m[2] === '' ? null : { depth: m[1].length, text: m[2] };
 }
 
-const ESCAPABLE_SET = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
+// ESCAPABLE char codes as a charCode->bool array (160-bit slice: 0x5C92 backslash, 0x240 backtick,
+// 0x19 star, 0x1A3 [, ] (, ) , #, +, -, ., !, >). Bit test: (ESCAPABLE[code] >> (code & 7)) & 1.
+// Built from the exact set the vendor escapes.
+function buildEscapable() {
+  const set = ['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>'];
+  const words = new Array(40).fill(0); // covers code 0..319 in groups of 8; all escapers are < 96
+  for (const ch of set) words[ch.charCodeAt(0) >> 3] |= 1 << (ch.charCodeAt(0) & 7);
+  return words;
+}
+const ESCAPABLE_WORDS = buildEscapable();
+const escapable = (code) => ((ESCAPABLE_WORDS[code >> 3] >>> (code & 7)) & 1) === 1;
 
 function findUnescaped(s, what, from) {
-  const w0 = what[0];
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE_SET.has(s[j + 1])) { j++; continue; }
-    if (s[j] === w0 && s.startsWith(what, j)) return j;
+  const w0 = what.charCodeAt(0);
+  const wlen = what.length;
+  for (let j = from; j <= s.length - wlen; j++) {
+    const c = s.charCodeAt(j);
+    if (c === 92 && j + 1 < s.length && escapable(s.charCodeAt(j + 1))) { j++; continue; }
+    if (c === w0 && s.startsWith(what, j)) return j;
   }
   return -1;
 }
 
 function findSingleStar(s, from) {
   for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE_SET.has(s[j + 1])) { j++; continue; }
-    if (c !== '*') continue;
-    if (s[j + 1] === '*') { j++; continue; }
+    const c = s.charCodeAt(j);
+    if (c === 92 && j + 1 < s.length && escapable(s.charCodeAt(j + 1))) { j++; continue; }
+    if (c !== 42) continue;
+    if (s.charCodeAt(j + 1) === 42) { j++; continue; }
     return j;
   }
   return -1;
 }
 
-const SPECIAL = new Set(['\\','`','*','[','&','<','>','"',"'"]);
 
 /** inline(s, link): escaped text with code/strong/em/link spans. */
 export function inline(s, link) {
@@ -245,20 +303,20 @@ export function inline(s, link) {
   let i = 0;
   const n = s.length;
   while (i < n) {
-    const c = s[i];
-    if (c === '\\' && i + 1 < n && ESCAPABLE_SET.has(s[i + 1])) {
+    const c = s.charCodeAt(i);
+    if (c === 92 && i + 1 < n && escapable(s.charCodeAt(i + 1))) {
       out += escapeHtml(s[i + 1]);
       i += 2;
       continue;
     }
-    if (c === '`') {
+    if (c === 96) { // backtick
       const j = s.indexOf('`', i + 1);
       if (j > i + 1) { out += `<code>${escapeHtml(s.slice(i + 1, j))}</code>`; i = j + 1; }
       else { out += '`'; i++; }
       continue;
     }
-    if (c === '*') {
-      if (s[i + 1] === '*') {
+    if (c === 42) { // star
+      if (s.charCodeAt(i + 1) === 42) {
         const j = findUnescaped(s, '**', i + 2);
         if (j > i + 2) { out += `<strong>${inline(s.slice(i + 2, j), link)}</strong>`; i = j + 2; }
         else { out += '**'; i += 2; }
@@ -269,9 +327,9 @@ export function inline(s, link) {
       else { out += '*'; i++; }
       continue;
     }
-    if (c === '[') {
+    if (c === 91) { // [
       const k = findUnescaped(s, ']', i + 1);
-      const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
       const target = m === -1 ? '' : s.slice(k + 2, m);
       if (target !== '' && !/\s/.test(target)) {
         out += `<a href="${escapeHtml(link(target))}">${inline(s.slice(i + 1, k), link)}</a>`;
@@ -282,15 +340,15 @@ export function inline(s, link) {
       i++;
       continue;
     }
-    // batch plain chars
+    // batch plain chars — no specials between i and j; slice wholesale
     let j = i;
     while (j < n) {
-      const d = s[j];
-      if (SPECIAL.has(d)) break;
+      const d = s.charCodeAt(j);
+      if (d === 92 || d === 96 || d === 42 || d === 91 || d === 38 || d === 60 || d === 62 || d === 34 || d === 39) break;
       j++;
     }
     if (j > i) { out += s.slice(i, j); i = j; continue; }
-    out += escapeHtml(c);
+    out += escapeHtml(String.fromCharCode(s.charCodeAt(i)));
     i++;
   }
   return out;
@@ -457,7 +515,19 @@ function tokenize(name, src) {
   return tokens;
 }
 
-export function parseTemplate(name, src) {
+// ---------- templates (compile once per run, reuse across that run's many renders) ----------
+export function parseTemplate(name, src, tplCache) {
+  if (tplCache !== undefined) {
+    let t = tplCache.get(name);
+    if (t !== undefined) return t;
+    t = compileTemplate(name, src);
+    tplCache.set(name, t);
+    return t;
+  }
+  return compileTemplate(name, src);
+}
+
+function compileTemplate(name, src) {
   const root = { kind: 'root', body: [] };
   const stack = [root];
   let body = root.body;
@@ -483,7 +553,7 @@ export function parseTemplate(name, src) {
         top.else = [];
         body = top.else;
       } else if (tag === 'endfor' || tag === 'endif') {
-        if (top.kind !== (tag === 'endfor' ? 'for' : 'if')) throw new TemplateError(`template "${name}": an ${tag} with no open ${tag.slice(3)}`);
+        if (top.kind !== (tag === 'endfor' ? 'for' : 'if')) throw new TemplateError(`template "${name}": a ${tag} with no open ${tag.slice(3)}`);
         stack.pop();
         const parent = stack[stack.length - 1];
         body = parent.kind === 'root' ? parent.body : parent.kind === 'for' ? parent.body : parent.else ?? parent.then;
@@ -495,23 +565,38 @@ export function parseTemplate(name, src) {
   return root.body;
 }
 
+// lookup / textOf: fast paths — the common shape is a short dotted path on a plain
+// object chain (loop var -> card object -> field); avoid the scope-walk when not needed.
 function lookup(scope, path) {
+  const len = path.length;
+  if (len === 1 && scope !== null && Object.hasOwn(scope.vars, path[0])) return scope.vars[path[0]];
   let s = scope;
   while (s !== null && !Object.hasOwn(s.vars, path[0])) s = s.parent;
   if (s === null) return undefined;
   let v = s.vars[path[0]];
-  for (let k = 1; k < path.length; k++) {
+  for (let k = 1; k < len; k++) {
     if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
     v = v[path[k]];
   }
   return v;
 }
 
+// textOf: the hot case is a string or number; avoid the generic fallthrough.
 function textOf(v) {
   if (typeof v === 'string') return v;
   if (typeof v === 'number') return String(v);
-  if (typeof v === 'boolean') return v ? 'true' : 'false';
-  if (Array.isArray(v)) return v.map(textOf).join(', ');
+  if (v === true) return 'true';
+  if (v === false) return 'false';
+  if (Array.isArray(v)) {
+    const n = v.length;
+    let out = '';
+    for (let i = 0; i < n; i++) {
+      const e = v[i];
+      if (i > 0) out += ', ';
+      out += textOf(e);
+    }
+    return out;
+  }
   return '';
 }
 
@@ -521,33 +606,38 @@ function truthy(v) {
 }
 
 export function renderNodes(nodes, scope, ctx, depth) {
+  const esc = ctx.escape; // cache the escape function: it is read on every {{ }}
   let out = '';
-  for (const n of nodes) {
-    switch (n.kind) {
-      case 'text': out += n.text; break;
-      case 'var': out += ctx.escape(textOf(lookup(scope, n.path))); break;
-      case 'raw': out += textOf(lookup(scope, n.path)); break;
-      case 'if': {
-        const v = truthy(lookup(scope, n.path));
-        const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) out += renderNodes(branch, scope, ctx, depth);
-        break;
+  for (let ni = 0; ni < nodes.length; ni++) {
+    const n = nodes[ni];
+    const kind = n.kind;
+    if (kind === 'text') { out += n.text; continue; }
+    if (kind === 'var') { out += esc(textOf(lookup(scope, n.path))); continue; }
+    if (kind === 'raw') { out += textOf(lookup(scope, n.path)); continue; }
+    if (kind === 'if') {
+      const v = truthy(lookup(scope, n.path));
+      const branch = v !== n.not ? n.then : n.else;
+      if (branch !== null) out += renderNodes(branch, scope, ctx, depth);
+      continue;
+    }
+    if (kind === 'for') {
+      const xs = lookup(scope, n.path);
+      if (!Array.isArray(xs)) continue;
+      const len = xs.length;
+      const loop = { index: 0, first: false, last: false, length: len };
+      const body = n.body;
+      const nm = n.name;
+      for (let k = 0; k < len; k++) {
+        loop.index = k + 1;
+        loop.first = k === 0;
+        loop.last = k === len - 1;
+        out += renderNodes(body, { vars: { [nm]: xs[k], loop }, parent: scope }, ctx, depth);
       }
-      case 'for': {
-        const xs = lookup(scope, n.path);
-        if (!Array.isArray(xs)) break;
-        const len = xs.length;
-        for (let k = 0; k < len; k++) {
-          const vars = { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === len - 1, length: len } };
-          out += renderNodes(n.body, { vars, parent: scope }, ctx, depth);
-        }
-        break;
-      }
-      case 'include': {
-        const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) out += renderNodes(t, scope, ctx, depth + 1);
-        break;
-      }
+      continue;
+    }
+    if (kind === 'include') {
+      const t = ctx.templates.get(n.name);
+      if (t !== undefined && depth < INCLUDE_DEPTH) out += renderNodes(t, scope, ctx, depth + 1);
     }
   }
   return out;
@@ -559,8 +649,15 @@ const REPORT_FILE = 'build-report.txt';
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+  let count = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    const ws = c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 0xa0 || c === 0xfeff || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000;
+    if (ws) inWord = false;
+    else if (!inWord) { inWord = true; count++; }
+  }
+  return count;
 }
 
 function resolvePath(dir, rel) {
@@ -580,11 +677,12 @@ const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/'
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
 export function build(input) {
-  // 0. templates (parse errors reported first)
+  // 0. templates (parse errors reported first; compiled once per run, reused by every render)
   const templates = new Map();
+  const tplCache = new Map(); // per-run cache for parseTemplate's compiled trees
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
-    try { templates.set(name, parseTemplate(name, input.templates[name])); }
+    try { templates.set(name, parseTemplate(name, input.templates[name], tplCache)); }
     catch (err) { if (!(err instanceof TemplateError)) throw err; report.push(err.message); }
   }
   const base = input.site.base_url.replace(/\/+$/, '');
@@ -667,21 +765,36 @@ export function build(input) {
 
   // 6. tags
   const bySlug = new Map();
+  // Cache slugify(name) per tag name: each tag name is slugified up to 3x per post
+  // (dedupe filter + lookup + record) and once more per page — collapse to 1x per name.
+  const slugCache = new Map();
+  const slugOfName = (name) => {
+    let v = slugCache.get(name);
+    if (v === undefined) { v = slugify(name); slugCache.set(name, v); }
+    return v;
+  };
   const ownTags = (s) => {
     const seen = new Set();
-    return (s.data.tags ?? []).filter((name) => !seen.has(slugify(name)) && seen.add(slugify(name)));
+    const names = s.data.tags ?? [];
+    const out = [];
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      const sl = slugOfName(name);
+      if (!seen.has(sl)) { seen.add(sl); out.push(name); }
+    }
+    return out;
   };
   for (const p of posts) {
     p.tagRefs = [];
     for (const name of ownTags(p)) {
-      const slug = slugify(name);
-      if (!bySlug.has(slug)) bySlug.set(slug, { name, slug, url: `${base}/tags/${slug}/`, posts: [] });
-      const tag = bySlug.get(slug);
+      const slug = slugOfName(name);
+      let tag = bySlug.get(slug);
+      if (tag === undefined) { tag = { name, slug, url: `${base}/tags/${slug}/`, posts: [] }; bySlug.set(slug, tag); }
       tag.posts.push(p);
       p.tagRefs.push(tag);
     }
   }
-  for (const s of sources) if (!s.post) s.tagRefs = ownTags(s).map((name) => bySlug.get(slugify(name)) ?? { name, slug: slugify(name), url: '', posts: [] });
+  for (const s of sources) if (!s.post) s.tagRefs = ownTags(s).map((name) => bySlug.get(slugOfName(name)) ?? { name, slug: slugOfName(name), url: '', posts: [] });
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
   // 7. layouts
