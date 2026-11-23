@@ -47,105 +47,150 @@ export function longDate(date) {
   return v;
 }
 
-// ---------- front matter ----------
-const KEYS = ['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary'];
-const KEY_SET = new Set(KEYS);
-const LINE_RE = /^([a-z_]+):(?: (.*))?$/;
-const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const BLANK_LINE = /^[ \t]*$/;
+// ---------- front matter (line-oriented, single-pass indexOf; matches makefun-site 1.0.0 byte for byte) ----------
 const NAME_RE = /^[a-z0-9-]+$/;
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const TAG_RE = /^[^"[\]]+$/;
-const BLANK_LINE = /^[ \t]*$/;
 
 function daysIn(y, m) {
   if (m === 2) return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0 ? 29 : 28;
   return m === 4 || m === 6 || m === 9 || m === 11 ? 30 : 31;
 }
 
-function stringOf(raw) {
-  if (raw.startsWith('"')) {
-    if (raw.length < 2 || !raw.endsWith('"')) return { error: 'a quoted string is not closed' };
-    let out = '';
-    for (let i = 1; i < raw.length - 1; i++) {
-      const c = raw[i];
-      if (c === '\\') {
-        const n = raw[i + 1];
-        if ((n !== '"' && n !== '\\') || i + 1 === raw.length - 1) return { error: 'a quoted string holds an escape other than \\" or \\\\' };
-        out += n;
-        i++;
-      } else if (c === '"') return { error: 'a quoted string holds a stray quote' };
-      else out += c;
-    }
-    return { value: out };
-  }
-  if (raw.startsWith('[')) return { error: 'a bare string opens on [' };
-  return { value: raw };
-}
-
-const DATE_OK = new Set();
+/** A YYYY-MM-DD real day, 1970-01-01 to 2099-12-31, checked without a regex. */
 function validDate(raw) {
-  if (DATE_OK.has(raw)) return true;
-  const m = DATE_RE.exec(raw);
-  if (!m) return false;
-  const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
-  if (y < 1970 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > daysIn(y, mo)) return false;
-  DATE_OK.add(raw);
-  return true;
+  const n = raw.length;
+  if (n !== 10) return false;
+  for (let k = 0; k < n; k++) {
+    const c = raw.charCodeAt(k);
+    if (k === 4 || k === 7) { if (c !== 45) return false; }
+    else if (c < 48 || c > 57) return false;
+  }
+  const y = (raw.charCodeAt(0) - 48) * 1000 + (raw.charCodeAt(1) - 48) * 100 + (raw.charCodeAt(2) - 48) * 10 + raw.charCodeAt(3) - 48;
+  const mo = (raw.charCodeAt(5) - 48) * 10 + raw.charCodeAt(6) - 48;
+  const d = (raw.charCodeAt(8) - 48) * 10 + raw.charCodeAt(9) - 48;
+  return y >= 1970 && y <= 2099 && mo >= 1 && mo <= 12 && d >= 1 && d <= daysIn(y, mo);
 }
 
+/** One line's { key, raw }, or null when it is not a "key: value" line. Blank and # lines are pre-filtered. */
+function lineOf(line) {
+  const n = line.length;
+  let j = 0;
+  let key = '';
+  while (j < n) {
+    const c = line.charCodeAt(j);
+    if ((c >= 97 && c <= 122) || c === 95) { key += line[j]; j++; }
+    else break;
+  }
+  if (j === 0 || j >= n || line.charCodeAt(j) !== 58) return null;
+  if (j + 1 === n) return { key, raw: '' };
+  if (line.charCodeAt(j + 1) !== 32) return null;
+  let raw = line.slice(j + 2);
+  // trailing spaces and tabs dropped, exactly as the reference's replace(/[ \t]+$/, '')
+  let end = raw.length;
+  while (end > 0) {
+    const c = raw.charCodeAt(end - 1);
+    if (c === 32 || c === 9) end--;
+    else break;
+  }
+  raw = raw.slice(0, end);
+  return { key, raw };
+}
+
+/** A quoted string value of raw (raw[0] === '"'): its text, or a reason string (vendor's exact error text). */
+function quotedString(raw) {
+  let out = '';
+  let i = 1;
+  const n = raw.length;
+  if (n < 2 || raw.charCodeAt(n - 1) !== 34) return 'a quoted string is not closed';
+  const end = n - 1;
+  while (i < end) {
+    const c = raw.charCodeAt(i);
+    if (c === 92) {
+      const nx = raw.charCodeAt(i + 1);
+      if ((nx !== 34 && nx !== 92) || i + 1 === end) return 'a quoted string holds an escape other than \\" or \\\\';
+      out += raw[i + 1];
+      i += 2;
+    } else if (c === 34) return 'a quoted string holds a stray quote';
+    else out += raw[i], i++;
+  }
+  return out;
+}
+
+/** One key's value, or the reference's exact error string. */
 function valueOf(key, raw) {
   switch (key) {
     case 'title':
     case 'summary': {
-      const s = stringOf(raw);
-      return 'error' in s ? { error: `key "${key}": ${s.error}` } : s;
+      if (raw.charCodeAt(0) === 34) {
+        const q = quotedString(raw);
+        if (typeof q === 'string' && q.startsWith('a quoted')) return `key "${key}": ${q}`;
+        return q;
+      }
+      if (raw.charCodeAt(0) === 91) return 'key "' + key + '": a bare string opens on [';
+      return raw;
     }
-    case 'date':
-      return validDate(raw) ? { value: raw } : { error: 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)' };
+    case 'date': return validDate(raw) ? raw : 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)';
     case 'tags': {
-      if (!raw.startsWith('[') || !raw.endsWith(']')) return { error: 'key "tags": not a list [a, b]' };
+      if (raw.charCodeAt(0) !== 91 || raw.charCodeAt(raw.length - 1) !== 93) return 'key "tags": not a list [a, b]';
       const inner = raw.slice(1, -1);
-      if (inner.trim() === '') return { value: [] };
+      if (inner.trim() === '') return [];
       const tags = inner.split(',').map((t) => t.trim());
-      if (tags.some((t) => t === '' || !TAG_RE.test(t))) return { error: 'key "tags": an empty tag, or one holding " [ or ]' };
-      return { value: tags };
+      for (const t of tags) if (t === '' || !TAG_RE.test(t)) return 'key "tags": an empty tag, or one holding " [ or ]';
+      return tags;
     }
-    case 'draft':
-      return raw === 'true' ? { value: true } : raw === 'false' ? { value: false } : { error: 'key "draft": true or false' };
-    case 'layout':
-      return NAME_RE.test(raw) ? { value: raw } : { error: 'key "layout": not a template name' };
-    case 'slug':
-      return SLUG_RE.test(raw) && raw.length <= 64 ? { value: raw } : { error: 'key "slug": not a slug' };
-    default:
-      return { error: `unknown key "${key}"` };
+    case 'draft': return raw === 'true' ? true : raw === 'false' ? false : 'key "draft": true or false';
+    case 'layout': return NAME_RE.test(raw) ? raw : 'key "layout": not a template name';
+    case 'slug': return (SLUG_RE.test(raw) && raw.length <= 64) ? raw : 'key "slug": not a slug';
+    default: return null; // unreachable: the caller checks the key first
   }
 }
 
+const KNOWN = new Set(['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary']);
+
+/**
+ * The front matter of `text` as { data, body } or { error } — the reference's rules and messages exactly.
+ * Vendor semantics: split on "\n"; line 0 must be exactly "---"; the first later exact "---" closes;
+ * between: blank (spaces/tabs only), a "#" comment, or "key: value"; anything else is the line error,
+ * numbered from 1 at the opening fence. An unclosed/stray/bad-escape quoted string is one error.
+ */
 export function parseFrontMatter(text) {
-  const lines = text.split('\n');
-  if (lines[0] !== '---') return { error: 'no front matter' };
-  let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') { close = i; break; }
+  if (text === '---' || !text.startsWith('---\n')) return { error: 'no front matter' };
+  const n = text.length;
+  let pos = 4;
+  let closePos = -1;
+  let closeLine = -1;
+  while (pos <= n) {
+    const nl = text.indexOf('\n', pos);
+    const lineEnd = nl === -1 ? n : nl;
+    if (lineEnd - pos === 3 && text.slice(pos, lineEnd) === '---') { closePos = lineEnd; closeLine = pos; break; }
+    pos = nl === -1 ? n + 1 : nl + 1;
   }
-  if (close === -1) return { error: 'the front matter is not closed' };
+  if (closePos === -1) return { error: 'the front matter is not closed' };
   const data = {};
-  for (let i = 1; i < close; i++) {
-    const line = lines[i];
-    if (BLANK_LINE.test(line) || line.startsWith('#')) continue;
-    const m = LINE_RE.exec(line);
-    if (!m) return { error: `line ${i + 1} is not "key: value"` };
-    const key = m[1];
-    const raw = (m[2] ?? '').replace(/[ \t]+$/, '');
-    if (!KEY_SET.has(key)) return { error: `unknown key "${key}"` };
-    if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
-    if (raw === '') return { error: `key "${key}" has no value` };
-    const v = valueOf(key, raw);
-    if ('error' in v) return v;
-    data[key] = v.value;
+  pos = 4;
+  let lineno = 2;
+  while (pos < closeLine) {
+    const nl = text.indexOf('\n', pos);
+    const lineEnd = nl === -1 ? closePos : nl;
+    const line = text.slice(pos, lineEnd);
+    pos = lineEnd + 1;
+    if (line !== '' && line.charCodeAt(0) !== 35 && !/^[ \t]*$/.test(line)) {
+      const li = lineOf(line);
+      if (!li) return { error: 'line ' + lineno + ' is not "key: value"' };
+      const { key, raw } = li;
+      if (!KNOWN.has(key)) return { error: 'unknown key "' + key + '"' };
+      if (Object.hasOwn(data, key)) return { error: 'key "' + key + '" is given twice' };
+      if (raw === '') return { error: 'key "' + key + '" has no value' };
+      const v = valueOf(key, raw);
+      if (typeof v === 'string' && v.startsWith('key "')) return { error: v };
+      data[key] = v;
+    }
+    lineno++;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  return { data, body: lines.slice(close + 1).join('\n') };
+  return { data, body: text.slice(closeLine + 4) };
 }
 
 // ---------- markdown ----------
